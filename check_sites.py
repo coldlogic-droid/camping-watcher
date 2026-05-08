@@ -1,6 +1,10 @@
 """
 Cyprus Lake Campsite Availability Checker
 Bruce Peninsula National Park — May 22–24, 2026
+
+Step 1: Find Cyprus Lake's resourceLocationId
+Step 2: Get its maps and resource-to-site-name mapping
+Step 3: Check availability correctly
 """
 
 import os
@@ -21,8 +25,7 @@ NTFY_TOPIC  = os.environ.get("NTFY_TOPIC", "")
 BOOKING_URL = "https://reservation.pc.gc.ca/"
 BASE_URL    = "https://reservation.pc.gc.ca"
 
-# No Accept-Encoding — let requests decompress automatically
-BROWSER_HEADERS = {
+HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -30,69 +33,122 @@ BROWSER_HEADERS = {
     ),
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "en-CA,en;q=0.9",
-    "Connection": "keep-alive",
     "Referer": BASE_URL + "/",
 }
 
 
-def get_session() -> requests.Session:
+def get_session():
     s = requests.Session()
-    s.headers.update(BROWSER_HEADERS)
-    print("Fetching homepage...")
-    try:
-        r = s.get(BASE_URL, timeout=15)
-        print(f"  Homepage status: {r.status_code}")
-        print(f"  Cookies: {dict(s.cookies)}")
-    except Exception as e:
-        print(f"  Homepage failed: {e}")
+    s.headers.update(HEADERS)
+    s.get(BASE_URL, timeout=15)
     return s
 
 
-def find_map_id(session: requests.Session) -> int | None:
+def find_cyprus_lake_location_id(session):
     """
-    /api/maps?resourceLocationId=-2147483644 returned 200 last run.
-    Parse it to get the mapId for the availability query.
+    Try several endpoints to list all Parks Canada resource locations
+    and find the one for Cyprus Lake / Bruce Peninsula.
     """
-    url = f"{BASE_URL}/api/maps"
-    params = {"resourceLocationId": -2147483644}
-    print(f"\nGET {url} params={params}")
-    try:
-        r = session.get(url, params=params, timeout=15)
-        print(f"  status: {r.status_code}")
-        print(f"  content-type: {r.headers.get('content-type','')}")
-        print(f"  raw text (first 800 chars): {r.text[:800]}")
+    endpoints_to_try = [
+        f"{BASE_URL}/api/resourcelocation/list",
+        f"{BASE_URL}/api/resourcelocation/search?query=cyprus",
+        f"{BASE_URL}/api/resourcelocation/search?query=bruce",
+        f"{BASE_URL}/api/resourcelocation/search?query=bruce+peninsula",
+    ]
 
-        if r.status_code != 200:
-            return None
-
-        data = r.json()
-        print(f"\nParsed JSON type: {type(data)}")
-
-        # Could be a list of maps or a single map object
-        if isinstance(data, list):
-            print(f"  {len(data)} map(s) returned:")
-            for m in data:
-                print(f"    {m}")
-            if data:
-                mid = data[0].get("id") or data[0].get("mapId")
-                print(f"  Using first map id={mid}")
-                return mid
-
-        elif isinstance(data, dict):
-            print(f"  Keys: {list(data.keys())}")
-            print(f"  Full: {data}")
-            mid = data.get("id") or data.get("mapId")
-            if mid:
-                print(f"  map id={mid}")
-                return mid
-
-    except Exception as e:
-        print(f"  Error: {e}")
+    for url in endpoints_to_try:
+        print(f"\nTrying: {url}")
+        try:
+            r = session.get(url, timeout=15)
+            print(f"  status: {r.status_code}")
+            if r.status_code == 200:
+                data = r.json()
+                items = data if isinstance(data, list) else data.get("resourceLocations", [])
+                print(f"  {len(items)} locations returned")
+                for item in items:
+                    name = str(
+                        item.get("name","")
+                        or item.get("localizedName","")
+                        or item.get("localizedValues",{}).get("name","")
+                    ).lower()
+                    if "cyprus" in name or "bruce" in name:
+                        print(f"  ✅ MATCH: {item}")
+                        return item.get("resourceLocationId") or item.get("id")
+                # Print all if no match
+                for item in items[:10]:
+                    print(f"    {item.get('name') or item.get('localizedName')} "
+                          f"id={item.get('resourceLocationId') or item.get('id')}")
+                if len(items) > 10:
+                    print(f"    ... and {len(items)-10} more")
+        except Exception as e:
+            print(f"  error: {e}")
 
     return None
 
 
-def get_availability(session: requests.Session, map_id: int) -> list[dict]:
+def get_maps_for_location(session, resource_location_id):
+    url = f"{BASE_URL}/api/maps"
+    params = {"resourceLocationId": resource_location_id}
+    print(f"\nGET {url} resourceLocationId={resource_location_id}")
+    r = session.get(url, params=params, timeout=15)
+    print(f"  status: {r.status_code}")
+    if r.status_code != 200:
+        return []
+    data = r.json()
+    maps = data if isinstance(data, list) else [data]
+    print(f"  {len(maps)} map(s):")
+    for m in maps:
+        title = next(
+            (lv.get("title","") for lv in m.get("localizedValues",[])
+             if lv.get("cultureName","") == "en-CA"),
+            m.get("mapId","")
+        )
+        print(f"    mapId={m['mapId']} title='{title}' resources={len(m.get('mapResources',[]))}")
+    return maps
+
+
+def build_resource_name_map(session, resource_location_id):
+    """
+    Query the resource details endpoint to get site names/numbers
+    for each resourceId.
+    Returns dict: resourceId -> site_name_string
+    """
+    url = f"{BASE_URL}/api/resourcelocation/{resource_location_id}/resources"
+    print(f"\nGET {url}")
+    try:
+        r = session.get(url, timeout=15)
+        print(f"  status: {r.status_code}  body: {r.text[:300]}")
+        if r.status_code == 200:
+            data = r.json()
+            resources = data if isinstance(data, list) else data.get("resources", [])
+            mapping = {}
+            for res in resources:
+                rid = str(res.get("resourceId") or res.get("id",""))
+                name = (
+                    res.get("name","")
+                    or res.get("localizedName","")
+                    or next(
+                        (lv.get("name","") for lv in res.get("localizedValues",[])
+                         if lv.get("cultureName","") == "en-CA"),
+                        ""
+                    )
+                )
+                if rid:
+                    mapping[rid] = name
+            print(f"  {len(mapping)} resources mapped")
+            return mapping
+    except Exception as e:
+        print(f"  error: {e}")
+    return {}
+
+
+def check_availability(session, map_id, resource_name_map):
+    """
+    Query availability. In GoingToCamp:
+      availability=0 → Available
+      availability=1 → Not available (booked/restricted)
+    Returns list of available target site names.
+    """
     url = f"{BASE_URL}/api/availability/map"
     params = {
         "mapId":               map_id,
@@ -103,53 +159,36 @@ def get_availability(session: requests.Session, map_id: int) -> list[dict]:
         "isReservationResult": "true",
         "partySize":           1,
     }
-    print(f"\nGET {url}")
-    print(f"  params: {params}")
-    try:
-        r = session.get(url, params=params, timeout=20)
-        print(f"  status: {r.status_code}")
-        print(f"  body (first 800): {r.text[:800]}")
-        if r.status_code != 200:
-            return []
-        data = r.json()
-        sites = (
-            data.get("availability")
-            or data.get("mapLinkAvailabilities")
-            or data.get("sites")
-            or (data if isinstance(data, list) else [])
-        )
-        print(f"  Total sites: {len(sites)}")
-        if sites:
-            print(f"  Sample keys: {list(sites[0].keys())}")
-            print(f"  Sample site: {sites[0]}")
-        return sites
-    except Exception as e:
-        print(f"  Error: {e}")
+    print(f"\nGET availability mapId={map_id}")
+    r = session.get(url, params=params, timeout=20)
+    print(f"  status: {r.status_code}")
+    if r.status_code != 200:
+        print(f"  body: {r.text[:300]}")
         return []
 
+    data = r.json()
+    resource_avails = data.get("resourceAvailabilities", {})
+    print(f"  {len(resource_avails)} resources in availability response")
 
-def check_target_sites(sites: list[dict]) -> list[str]:
     available = []
-    for site in sites:
-        name = (
-            str(site.get("name",""))
-            or str(site.get("siteName",""))
-            or str(site.get("mapLinkName",""))
-        ).strip()
-        is_available = (
-            site.get("availability") == "Available"
-            or site.get("isAvailable") is True
-            or str(site.get("availability","")).lower() == "available"
-            or site.get("availableCount", 0) > 0
+    for resource_id, avail_list in resource_avails.items():
+        site_name = resource_name_map.get(str(resource_id), "").strip()
+        if not site_name:
+            continue
+        # availability=0 means available in GoingToCamp
+        is_available = any(
+            a.get("availability") == 0 for a in avail_list
         )
-        if name in TARGET_SITE_NAMES:
-            print(f"  Site {name}: {'✅ AVAILABLE' if is_available else '❌ taken'}")
+        if site_name in TARGET_SITE_NAMES:
+            status = "✅ AVAILABLE" if is_available else "❌ taken"
+            print(f"  Site {site_name} (id={resource_id}): {status}")
             if is_available:
-                available.append(name)
+                available.append(site_name)
+
     return available
 
 
-def send_notification(site_numbers: list[str]):
+def send_notification(site_numbers):
     if not NTFY_TOPIC:
         print("NTFY_TOPIC not set — skipping")
         return
@@ -173,27 +212,33 @@ def send_notification(site_numbers: list[str]):
 
 if __name__ == "__main__":
     print(f"[{datetime.now().isoformat()}] Checking {START_DATE} → {END_DATE}")
-    print(f"Targets: {sorted(TARGET_SITE_NAMES)}")
     print("=" * 60)
 
     session = get_session()
-    map_id = find_map_id(session)
 
-    if not map_id:
-        print("\nCould not determine map ID.")
+    loc_id = find_cyprus_lake_location_id(session)
+    if not loc_id:
+        print("\nCould not find Cyprus Lake resource location ID.")
         sys.exit(1)
 
-    print(f"\nUsing map_id={map_id}")
-    sites = get_availability(session, map_id)
+    print(f"\n✅ Cyprus Lake resourceLocationId = {loc_id}")
 
-    if not sites:
-        print("No site data returned.")
-        sys.exit(0)
+    maps = get_maps_for_location(session, loc_id)
+    if not maps:
+        print("No maps found.")
+        sys.exit(1)
 
-    available = check_target_sites(sites)
+    resource_name_map = build_resource_name_map(session, loc_id)
+
+    available_all = []
+    for m in maps:
+        avail = check_availability(session, m["mapId"], resource_name_map)
+        available_all.extend(avail)
+
+    available_all = sorted(set(available_all))
     print("=" * 60)
-    if available:
-        print(f"AVAILABLE: {available}")
-        send_notification(available)
+    if available_all:
+        print(f"🚨 AVAILABLE: {available_all}")
+        send_notification(available_all)
     else:
         print("No target sites available.")
