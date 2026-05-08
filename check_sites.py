@@ -1,12 +1,6 @@
 """
-Cyprus Lake Campsite Availability Checker — discovery + drill-down version
-
-We know: Bruce Peninsula Overview Map = mapId -2147483584
-Strategy:
-  1. Fetch that overview map, list its mapLinks
-  2. Follow links to find Cyprus Lake child map
-  3. Drill into Cyprus Lake → list its mapLinks (Poplars, Tamaracks, Birches, ...)
-  4. Print everything found so we can identify the target loops
+Cyprus Lake — Find resourceId → site name mapping
+Discovery only, no notification yet.
 """
 
 import os
@@ -16,7 +10,19 @@ from datetime import datetime
 
 START_DATE = "2026-05-22"
 END_DATE   = "2026-05-24"
+NIGHTS     = 2
 BASE_URL   = "https://reservation.pc.gc.ca"
+
+CYPRUS_LAKE_RLID  = -2147483636
+POPLARS_MAP_ID    = -2147483581
+BIRCHES_MAP_ID    = -2147483580
+TAMARACKS_MAP_ID  = -2147483579
+
+LOOPS = [
+    ("Poplars",   POPLARS_MAP_ID),
+    ("Birches",   BIRCHES_MAP_ID),
+    ("Tamaracks", TAMARACKS_MAP_ID),
+]
 
 HEADERS = {
     "User-Agent": (
@@ -29,8 +35,6 @@ HEADERS = {
     "Referer": BASE_URL + "/",
 }
 
-BRUCE_OVERVIEW_MAP_ID = -2147483584
-
 
 def get_session():
     s = requests.Session()
@@ -39,123 +43,114 @@ def get_session():
     return s
 
 
-def map_title(m):
-    for lv in m.get("localizedValues", []):
-        if lv.get("cultureName") == "en-CA":
-            t = lv.get("title","")
-            d = lv.get("description","")
-            return f"{t} — {d}".strip(" —")
-    return str(m.get("mapId",""))
+def try_endpoint(session, url, params=None, label=""):
+    print(f"\n[{label}] GET {url}")
+    if params: print(f"  params: {params}")
+    try:
+        r = session.get(url, params=params, timeout=15)
+        print(f"  status: {r.status_code}")
+        if r.status_code != 200:
+            print(f"  body: {r.text[:200]}")
+            return None
+        return r.json()
+    except Exception as e:
+        print(f"  error: {e}")
+        return None
 
 
-def fetch_map_by_id(session, map_id):
-    """
-    The /api/maps endpoint takes resourceLocationId. To get a single map by ID
-    we need a different endpoint. Try a few.
-    """
-    candidates = [
-        (f"{BASE_URL}/api/map", {"mapId": map_id}),
-        (f"{BASE_URL}/api/maps", {"mapId": map_id}),
-        (f"{BASE_URL}/api/map/{map_id}", None),
-        (f"{BASE_URL}/api/maps/{map_id}", None),
-    ]
-    for url, params in candidates:
-        try:
-            r = session.get(url, params=params, timeout=10) if params else session.get(url, timeout=10)
-            if r.status_code == 200:
-                data = r.json()
-                if isinstance(data, dict) and data.get("mapId"):
-                    print(f"  ✅ {url} {params or ''} → mapId={data['mapId']}")
-                    return data
-                if isinstance(data, list) and data:
-                    for m in data:
-                        if m.get("mapId") == map_id:
-                            print(f"  ✅ {url} {params or ''} → mapId={m['mapId']}")
-                            return m
-        except Exception as e:
-            pass
-    return None
-
-
-def fetch_maps_for_location(session, resource_location_id):
-    """Get all maps that share this resourceLocationId."""
-    r = session.get(
-        f"{BASE_URL}/api/maps",
-        params={"resourceLocationId": resource_location_id},
-        timeout=15,
+def get_availability(session, map_id):
+    """Get availability response — has resourceIds and their availability status."""
+    data = try_endpoint(session,
+        f"{BASE_URL}/api/availability/map",
+        params={
+            "mapId":               map_id,
+            "bookingCategoryId":   0,
+            "startDate":           START_DATE,
+            "endDate":             END_DATE,
+            "nights":              NIGHTS,
+            "isReservationResult": "true",
+            "partySize":           1,
+        },
+        label=f"availability mapId={map_id}",
     )
-    if r.status_code != 200:
-        return []
-    data = r.json()
-    return data if isinstance(data, list) else [data]
+    if not data:
+        return {}
+    return data.get("resourceAvailabilities", {})
 
 
-def explore(session):
-    print(f"Fetching Bruce Peninsula Overview Map (mapId={BRUCE_OVERVIEW_MAP_ID})...")
-    overview = fetch_map_by_id(session, BRUCE_OVERVIEW_MAP_ID)
-    if not overview:
-        print("Could not fetch overview map — trying scan instead.")
-        # Try scanning resourceLocationIds near Bruce Peninsula
-        for rlid in range(-2147483600, -2147483500):
-            maps = fetch_maps_for_location(session, rlid)
-            for m in maps:
-                t = map_title(m).lower()
-                if "bruce" in t or "cyprus" in t or "tamarack" in t or "poplar" in t:
-                    print(f"  rlid={rlid} mapId={m['mapId']} → '{map_title(m)}'")
-        return
+def try_get_resource_names(session, resource_location_id, sample_resource_id=None):
+    """Try every endpoint pattern to find resource name → resourceId mapping."""
+    print("\n" + "=" * 60)
+    print("TRYING TO FIND RESOURCE NAMES")
+    print("=" * 60)
 
-    print(f"\n  Title: {map_title(overview)}")
-    print(f"  resourceLocationId: {overview.get('resourceLocationId')}")
-    print(f"  parentMap: {overview.get('parentMap')}")
+    candidates = [
+        f"{BASE_URL}/api/resource/list/{resource_location_id}",
+        f"{BASE_URL}/api/resourceCategory/list/{resource_location_id}",
+        f"{BASE_URL}/api/resourceCategory?resourceLocationId={resource_location_id}",
+        f"{BASE_URL}/api/availability/resourceLocation",
+        f"{BASE_URL}/api/availability/resourcelocation",
+    ]
+    for url in candidates:
+        data = try_endpoint(session, url,
+            params={"resourceLocationId": resource_location_id} if "?" not in url else None,
+            label=url.split("/api/")[-1])
+        if data:
+            print(f"  Type: {type(data).__name__}")
+            if isinstance(data, list) and data:
+                print(f"  {len(data)} items, sample: {data[0]}")
+            elif isinstance(data, dict):
+                print(f"  Keys: {list(data.keys())[:20]}")
+                # Find any items that look like resources
+                for k, v in data.items():
+                    if isinstance(v, list) and v and isinstance(v[0], dict):
+                        print(f"  {k}: {len(v)} items, sample: {v[0]}")
+                        break
 
-    map_links = overview.get("mapLinks", [])
-    print(f"\n  {len(map_links)} mapLinks (children):")
-    for link in map_links:
-        loc_strs = [
-            f"{lv.get('cultureName','')}={lv.get('title','')}"
-            for lv in link.get("localizations", [])
-        ]
-        print(f"    childMapId={link.get('childMapId')} "
-              f"resourceLocationId={link.get('resourceLocationId')} "
-              f"titles=[{', '.join(loc_strs)}]")
+    if sample_resource_id:
+        # Try fetching individual resource
+        for url in [
+            f"{BASE_URL}/api/resource/{sample_resource_id}",
+            f"{BASE_URL}/api/resource?id={sample_resource_id}",
+        ]:
+            data = try_endpoint(session, url, label=f"single resource {sample_resource_id}")
+            if data:
+                print(f"  Got resource: {data}")
 
-    # For each child link, try to fetch and look for Cyprus Lake
-    print("\n--- Drilling into each child ---")
-    for link in map_links:
-        child_id = link.get("childMapId")
-        rlid = link.get("resourceLocationId")
-        if not child_id:
-            continue
 
-        # Get title from the link itself
-        title = ", ".join(
-            lv.get("title","") for lv in link.get("localizations", [])
-            if lv.get("cultureName") == "en-CA"
-        )
-        print(f"\n  childMapId={child_id} title='{title}' rlid={rlid}")
+def main():
+    print(f"[{datetime.now().isoformat()}]")
+    session = get_session()
 
-        if rlid:
-            # Fetch all maps for this resourceLocationId
-            maps = fetch_maps_for_location(session, rlid)
-            print(f"    → {len(maps)} map(s) at this location:")
-            for m in maps:
-                t = map_title(m)
-                print(f"      mapId={m['mapId']}  '{t}'  "
-                      f"resources={len(m.get('mapResources',[]))} "
-                      f"links={len(m.get('mapLinks',[]))}")
+    print("\n" + "=" * 60)
+    print("AVAILABILITY FOR EACH LOOP")
+    print("=" * 60)
 
-                # If this map has its own mapLinks, list those too
-                for sublink in m.get("mapLinks", []):
-                    sub_title = ", ".join(
-                        lv.get("title","") for lv in sublink.get("localizations", [])
-                        if lv.get("cultureName") == "en-CA"
-                    )
-                    print(f"        sublink → mapId={sublink.get('childMapId')} "
-                          f"title='{sub_title}' rlid={sublink.get('resourceLocationId')}")
+    sample_resource_id = None
+    all_resources = {}  # resourceId -> {loop, availability}
+
+    for loop_name, map_id in LOOPS:
+        avails = get_availability(session, map_id)
+        print(f"\n  {loop_name}: {len(avails)} resources returned")
+        # Print first 3 entries as sample
+        for i, (rid, alist) in enumerate(list(avails.items())[:5]):
+            avail_codes = [a.get("availability") for a in alist]
+            print(f"    resourceId={rid} availability={avail_codes}")
+            if not sample_resource_id:
+                sample_resource_id = rid
+            all_resources[rid] = {"loop": loop_name, "availability": avail_codes}
+
+        # Count by status
+        counts = {}
+        for rid, alist in avails.items():
+            for a in alist:
+                code = a.get("availability")
+                counts[code] = counts.get(code, 0) + 1
+        print(f"    Status code counts: {counts}")
+
+    # Now try to find names
+    try_get_resource_names(session, CYPRUS_LAKE_RLID, sample_resource_id)
 
 
 if __name__ == "__main__":
-    print(f"[{datetime.now().isoformat()}]")
-    print("=" * 60)
-    session = get_session()
-    explore(session)
+    main()
