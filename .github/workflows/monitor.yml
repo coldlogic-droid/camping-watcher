@@ -2,26 +2,19 @@ name: ⛺ Campsite Monitor
 
 on:
   schedule:
-    - cron: '*/10 * * * *'  # every 10 minutes, 24/7
-  workflow_dispatch:         # also allows manual test run
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
 
 jobs:
   check:
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-          cache: 'pip'
-
-      - name: Install camply
-        run: pip install camply
+      - name: Install requests
+        run: pip install requests
 
       - name: Check availability and notify
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
-        run: |
-          python check_sites.py
+        run: python check_sites.py
