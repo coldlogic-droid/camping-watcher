@@ -1,148 +1,199 @@
 """
 Cyprus Lake Campsite Availability Checker
 Bruce Peninsula National Park — May 22–24, 2026
-
-Target sites:
-  Poplars:   101–118
-  Tamaracks: 223, 226, 227, 228, 232, 233, 238, 240, 242
-
-SETUP REQUIRED:
-  After running the discover workflow, fill in the values below:
-    CAMPGROUND_ID  — from camply campgrounds output
-    TARGET_SITE_IDS — the internal IDs matching your target site numbers
-                      (match them by name in the list-campsites output)
+Hits the Parks Canada / GoingToCamp API directly.
 """
 
 import os
 import sys
-import subprocess
 import requests
-import json
+from datetime import datetime
 
 # ─────────────────────────────────────────────────────────────────
-# FILL THESE IN after running the discover workflow
+# Target sites
 # ─────────────────────────────────────────────────────────────────
-CAMPGROUND_ID = "FILL_IN_AFTER_DISCOVERY"   # e.g. "232" or whatever Parks Canada uses
-
-# Map of site number (as shown on Parks Canada site) → internal camply ID
-# Run discover workflow, find your target sites in the list-campsites output,
-# then paste their internal IDs here.
-TARGET_SITES = {
-    # "site_number": "internal_id",
-    # Examples (replace with real values from discover output):
-    # "101": "12345",
-    # "223": "12399",
+TARGET_SITE_NAMES = {
+    # Poplars
+    "101", "102", "103", "104", "105", "106", "107", "108",
+    "109", "110", "111", "112", "113", "114", "115", "116",
+    "117", "118",
+    # Tamaracks
+    "223", "226", "227", "228", "232", "233", "238", "240", "242",
 }
+
+START_DATE  = "2026-05-22"
+END_DATE    = "2026-05-24"
+NIGHTS      = 2
+NTFY_TOPIC  = os.environ.get("NTFY_TOPIC", "")
+BOOKING_URL = "https://reservation.pc.gc.ca/"
+
+# Parks Canada GoingToCamp API
+BASE_URL       = "https://reservation.pc.gc.ca"
+REC_AREA_ID    = 14          # Parks Canada on GoingToCamp
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; campsite-checker/1.0)",
+    "Accept": "application/json",
+    "Referer": BASE_URL,
+}
+
 # ─────────────────────────────────────────────────────────────────
 
-START_DATE = "2026-05-22"
-END_DATE   = "2026-05-24"
-NIGHTS     = 2
-NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "")
-BOOKING_URL = "https://reservation.pc.gc.ca/"
+def get_session() -> requests.Session:
+    s = requests.Session()
+    s.headers.update(HEADERS)
+    # Hit the homepage first to pick up any session cookies
+    try:
+        s.get(BASE_URL, timeout=15)
+    except Exception:
+        pass
+    return s
+
+
+def find_cyprus_lake_map_id(session: requests.Session) -> int | None:
+    """
+    Get all facilities/campgrounds for Parks Canada (rec area 14)
+    and find Cyprus Lake's mapId.
+    """
+    url = f"{BASE_URL}/api/resourcelocation/list/{REC_AREA_ID}"
+    try:
+        resp = session.get(url, timeout=15)
+        print(f"Resource location list status: {resp.status_code}")
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        # Look for Cyprus Lake / Bruce Peninsula
+        for item in data:
+            name = str(item.get("name", "") or item.get("localizedName", "")).lower()
+            if "cyprus" in name or "bruce peninsula" in name:
+                map_id = item.get("mapId") or item.get("id")
+                print(f"Found: {item.get('name')} → mapId={map_id}")
+                return map_id
+        # If not found, print all options to help debug
+        print("Cyprus Lake not found. Available facilities:")
+        for item in data:
+            print(f"  {item.get('name')} id={item.get('id')} mapId={item.get('mapId')}")
+    except Exception as e:
+        print(f"Error fetching facilities: {e}")
+    return None
+
+
+def get_availability(session: requests.Session, map_id: int) -> list[dict]:
+    """
+    Query the availability endpoint for the campground map.
+    Returns list of available site objects.
+    """
+    url = f"{BASE_URL}/api/availability/map"
+    params = {
+        "mapId":               map_id,
+        "bookingCategoryId":   0,
+        "startDate":           START_DATE,
+        "endDate":             END_DATE,
+        "nights":              NIGHTS,
+        "isReservationResult": "true",
+        "partySize":           1,
+    }
+    try:
+        resp = session.get(url, params=params, timeout=20)
+        print(f"Availability status: {resp.status_code}")
+        if resp.status_code != 200:
+            print(f"Response body: {resp.text[:500]}")
+            return []
+        data = resp.json()
+        # Response is typically a dict with a "availability" or "mapLinkAvailabilities" key
+        sites = (
+            data.get("availability")
+            or data.get("mapLinkAvailabilities")
+            or data.get("sites")
+            or (data if isinstance(data, list) else [])
+        )
+        print(f"Total sites returned: {len(sites)}")
+        return sites
+    except Exception as e:
+        print(f"Error fetching availability: {e}")
+        return []
+
+
+def check_target_sites(sites: list[dict]) -> list[str]:
+    """
+    Filter available sites down to our target list.
+    Returns list of available target site names/numbers.
+    """
+    available = []
+    for site in sites:
+        # GoingToCamp uses various field names
+        name = (
+            str(site.get("name", ""))
+            or str(site.get("siteName", ""))
+            or str(site.get("mapLinkName", ""))
+        ).strip()
+        is_available = (
+            site.get("availability") == "Available"
+            or site.get("isAvailable") is True
+            or str(site.get("availability", "")).lower() == "available"
+            or site.get("availableCount", 0) > 0
+        )
+        if is_available and name in TARGET_SITE_NAMES:
+            available.append(name)
+            print(f"  ✅ Site {name} is AVAILABLE")
+    return available
 
 
 def send_notification(site_numbers: list[str]):
-    """Send an ntfy push notification to iOS."""
     if not NTFY_TOPIC:
         print("WARNING: NTFY_TOPIC not set — skipping notification")
         return
-
-    site_list = ", ".join(site_numbers)
+    site_list = ", ".join(sorted(site_numbers))
     message = (
         f"🏕️ CAMPSITE AVAILABLE!\n"
         f"Sites: {site_list}\n"
-        f"Dates: {START_DATE} → {END_DATE}\n"
-        f"Book NOW → {BOOKING_URL}"
+        f"Dates: {START_DATE} to {END_DATE}\n"
+        f"Book NOW: {BOOKING_URL}"
     )
-
     try:
         resp = requests.post(
             f"https://ntfy.sh/{NTFY_TOPIC}",
             data=message.encode("utf-8"),
             headers={
-                "Title": "Campsite Alert — Bruce Peninsula",
+                "Title":    "Campsite Alert — Bruce Peninsula",
                 "Priority": "urgent",
-                "Tags": "tent,rotating_light",
-                "Click": BOOKING_URL,
+                "Tags":     "tent,rotating_light",
+                "Click":    BOOKING_URL,
             },
             timeout=10,
         )
         if resp.status_code == 200:
             print(f"✅ Notification sent for sites: {site_list}")
         else:
-            print(f"⚠️ ntfy returned {resp.status_code}: {resp.text}")
+            print(f"⚠️  ntfy returned {resp.status_code}: {resp.text}")
     except Exception as e:
         print(f"❌ Failed to send notification: {e}")
 
 
-def check_availability() -> list[str]:
-    """
-    Use camply to check for available sites and return a list
-    of available site numbers from our target list.
-    """
-    if CAMPGROUND_ID == "FILL_IN_AFTER_DISCOVERY" or not TARGET_SITES:
-        print("ERROR: You must fill in CAMPGROUND_ID and TARGET_SITES.")
-        print("Run the discover workflow first, then update check_sites.py.")
+if __name__ == "__main__":
+    print(f"[{datetime.utcnow().isoformat()}] Checking availability {START_DATE} → {END_DATE}")
+    print(f"Target sites: {sorted(TARGET_SITE_NAMES)}")
+    print("─" * 60)
+
+    session = get_session()
+
+    map_id = find_cyprus_lake_map_id(session)
+    if not map_id:
+        print("Could not find Cyprus Lake map ID — dumping raw response for debugging")
         sys.exit(1)
 
-    internal_ids = list(TARGET_SITES.values())
-    id_to_number = {v: k for k, v in TARGET_SITES.items()}
+    print(f"Cyprus Lake map ID: {map_id}")
+    print("─" * 60)
 
-    # Build camply command — use silent mode (no looping, just check once)
-    cmd = [
-        "camply", "campsites",
-        "--provider", "CanadaParks",
-        "--campground", CAMPGROUND_ID,
-        "--start-date", START_DATE,
-        "--end-date", END_DATE,
-        "--nights", str(NIGHTS),
-        "--notifications", "silent",  # don't loop — we handle notification ourselves
-    ]
-    for site_id in internal_ids:
-        cmd += ["--campsite-id", site_id]
+    sites = get_availability(session, map_id)
+    if not sites:
+        print("No site data returned — may need to adjust API params")
+        sys.exit(0)
 
-    print(f"Running: {' '.join(cmd)}")
+    available = check_target_sites(sites)
 
-    try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-        output = result.stdout + result.stderr
-        print("camply output:\n", output)
-
-        # Parse which internal IDs appear as available in the output
-        available_numbers = []
-        for internal_id, site_number in id_to_number.items():
-            if internal_id in output and (
-                "Available" in output or "available" in output or "AVAILABLE" in output
-            ):
-                available_numbers.append(site_number)
-
-        return available_numbers
-
-    except subprocess.TimeoutExpired:
-        print("camply timed out")
-        return []
-    except Exception as e:
-        print(f"camply error: {e}")
-        return []
-
-
-if __name__ == "__main__":
-    print(f"Checking availability for May 22–24 | Campground: {CAMPGROUND_ID}")
-    print(f"Target sites: {list(TARGET_SITES.keys())}")
-    print("─" * 50)
-
-    available = check_availability()
-
+    print("─" * 60)
     if available:
-        print(f"\n🚨 AVAILABLE SITES FOUND: {available}")
+        print(f"🚨 AVAILABLE: {available}")
         send_notification(available)
-        sys.exit(0)
     else:
-        print("\nNo target sites available right now. Will check again in 10 minutes.")
-        sys.exit(0)
+        print("No target sites available right now.")
