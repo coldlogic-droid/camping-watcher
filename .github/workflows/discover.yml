@@ -7,13 +7,12 @@ jobs:
   discover:
     runs-on: ubuntu-latest
     steps:
-      - name: Install camply
-        run: pip install camply
+      - uses: actions/checkout@v4
 
-      - name: Verify camply installed
-        run: |
-          pip show camply
-          camply --version
+      - name: Install dependencies
+        run: pip install requests
 
-      - name: Find Cyprus Lake campground ID
-        run: camply campgrounds --provider GoingToCamp --rec-area 14
+      - name: Run checker (debug mode)
+        env:
+          NTFY_TOPIC: ""
+        run: python check_sites.py
