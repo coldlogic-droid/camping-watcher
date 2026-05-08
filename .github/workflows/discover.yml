@@ -15,5 +15,5 @@ jobs:
           pip show camply
           camply --version
 
-      - name: List GoingToCamp recreation areas
-        run: camply --debug recreation-areas --provider GoingToCamp
+      - name: Find Cyprus Lake campground ID
+        run: camply campgrounds --provider GoingToCamp --rec-area 14
