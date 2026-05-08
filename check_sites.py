@@ -1,21 +1,49 @@
 """
-Cyprus Lake — Aggressive endpoint discovery for resource name mapping
+Cyprus Lake Campsite Watcher — Production
+Bruce Peninsula National Park
+Dates: May 22-24, 2026 (2 nights)
+
+Monitors three loops and fires an ntfy alert when any site opens up:
+  - Poplars   (mapId -2147483581)  — user wants ANY site
+  - Birches   (mapId -2147483580)  — user wants 101-118
+  - Tamaracks (mapId -2147483579)  — user wants 223,226,227,228,232,233,238,240,242
+
+Strategy:
+  Since the API doesn't expose resourceId→site-number mapping, we notify on
+  ANY status-0 (available) site in each loop. The notification includes a
+  direct link to that loop so the user can verify the specific site and book.
+
+GoingToCamp availability codes seen so far:
+  0 = Available (the target — fire alert)
+  1 = Reserved
+  4 = Closed/Restricted
+  7 = Other restriction (winter-only / first-come)
 """
 
 import os
 import sys
-import json
 import requests
 from datetime import datetime
 
+# Trip parameters
 START_DATE = "2026-05-22"
 END_DATE   = "2026-05-24"
 NIGHTS     = 2
-BASE_URL   = "https://reservation.pc.gc.ca"
 
+# Cyprus Lake at Bruce Peninsula National Park
+BASE_URL          = "https://reservation.pc.gc.ca"
 CYPRUS_LAKE_RLID  = -2147483636
-POPLARS_MAP_ID    = -2147483581
-SAMPLE_RID        = -2147481250
+
+LOOPS = [
+    {"name": "Poplars",   "map_id": -2147483581, "site_range": "1-63"},
+    {"name": "Birches",   "map_id": -2147483580, "site_range": "100-198"},
+    {"name": "Tamaracks", "map_id": -2147483579, "site_range": "201-281"},
+]
+
+# Codes that mean the site is bookable
+AVAILABLE_CODES = {0}
+
+NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "")
 
 HEADERS = {
     "User-Agent": (
@@ -26,148 +54,123 @@ HEADERS = {
     "Accept": "application/json, */*",
     "Accept-Language": "en-CA,en;q=0.9",
     "Referer": BASE_URL + "/",
-    "Content-Type": "application/json",
 }
 
 
-def get_session():
+def get_session() -> requests.Session:
     s = requests.Session()
     s.headers.update(HEADERS)
     s.get(BASE_URL, timeout=15)
     return s
 
 
-def show(label, r):
-    print(f"\n[{label}]  {r.request.method} {r.url}")
-    print(f"  status: {r.status_code}")
-    snippet = r.text[:600].replace("\n", " ")
-    print(f"  body:   {snippet}")
-
-
-def test(session, method, path, params=None, body=None, label=None):
-    url = BASE_URL + path
+def check_loop(session: requests.Session, loop: dict) -> int:
+    """
+    Returns count of available sites (status 0) in the given loop.
+    """
+    url = f"{BASE_URL}/api/availability/map"
+    params = {
+        "mapId":               loop["map_id"],
+        "bookingCategoryId":   0,
+        "startDate":           START_DATE,
+        "endDate":             END_DATE,
+        "nights":              NIGHTS,
+        "isReservationResult": "true",
+        "partySize":           1,
+    }
     try:
-        if method == "GET":
-            r = session.get(url, params=params, timeout=15)
-        else:
-            r = session.post(url, params=params, json=body, timeout=15)
-        show(label or path, r)
-        if r.status_code == 200:
-            try:
-                return r.json()
-            except Exception:
-                return r.text
+        r = session.get(url, params=params, timeout=20)
+        if r.status_code != 200:
+            print(f"  {loop['name']}: HTTP {r.status_code}")
+            return 0
+        data = r.json()
+        resource_avails = data.get("resourceAvailabilities", {})
+
+        available_count = 0
+        status_breakdown = {}
+        for rid, alist in resource_avails.items():
+            for a in alist:
+                code = a.get("availability")
+                status_breakdown[code] = status_breakdown.get(code, 0) + 1
+                if code in AVAILABLE_CODES:
+                    available_count += 1
+
+        print(f"  {loop['name']:10s} ({loop['site_range']}): "
+              f"{len(resource_avails)} sites, "
+              f"available={available_count}, breakdown={status_breakdown}")
+        return available_count
     except Exception as e:
-        print(f"\n[{label or path}] ERROR: {e}")
-    return None
+        print(f"  {loop['name']}: ERROR {e}")
+        return 0
+
+
+def booking_url_for(loop: dict) -> str:
+    return (
+        f"{BASE_URL}/create-booking/results"
+        f"?mapId={loop['map_id']}"
+        f"&resourceLocationId={CYPRUS_LAKE_RLID}"
+        f"&startDate={START_DATE}&endDate={END_DATE}"
+        f"&nights={NIGHTS}&bookingCategoryId=0"
+    )
+
+
+def send_notification(alerts: list[dict]):
+    if not NTFY_TOPIC:
+        print("WARNING: NTFY_TOPIC not set — skipping notification")
+        return
+
+    lines = [f"🏕️  Cyprus Lake openings for {START_DATE} → {END_DATE}!"]
+    for a in alerts:
+        lines.append(f"• {a['name']} ({a['site_range']}): {a['count']} site(s)")
+    lines.append("")
+    lines.append("Tap to book — book FAST, cancellations get snapped up in minutes.")
+
+    message = "\n".join(lines)
+    primary_url = booking_url_for(alerts[0]["loop"])
+
+    try:
+        resp = requests.post(
+            f"https://ntfy.sh/{NTFY_TOPIC}",
+            data=message.encode("utf-8"),
+            headers={
+                "Title":    "Campsite Alert — Bruce Peninsula",
+                "Priority": "urgent",
+                "Tags":     "tent,rotating_light",
+                "Click":    primary_url,
+            },
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            print(f"✅ Notification sent")
+        else:
+            print(f"⚠️  ntfy returned {resp.status_code}: {resp.text}")
+    except Exception as e:
+        print(f"❌ Notification failed: {e}")
 
 
 def main():
-    print(f"[{datetime.now().isoformat()}]")
-    print("=" * 70)
-    s = get_session()
+    print(f"[{datetime.now().isoformat()}] Checking Cyprus Lake {START_DATE} → {END_DATE}")
+    session = get_session()
 
-    # 1. List ALL resourceCategories to see if there's site-level data
-    print("\n### 1. All resourceCategories (full dump)")
-    cats = test(s, "GET", "/api/resourceCategory",
-                params={"resourceLocationId": CYPRUS_LAKE_RLID},
-                label="resourceCategory")
-    if isinstance(cats, list):
-        print(f"\n  {len(cats)} categories:")
-        for c in cats:
-            name = next((lv["name"] for lv in c.get("localizedValues",[])
-                         if lv.get("cultureName")=="en-CA"), "")
-            print(f"    id={c.get('resourceCategoryId')}  name='{name}'  type={c.get('resourceType')}")
+    alerts = []
+    for loop in LOOPS:
+        count = check_loop(session, loop)
+        if count > 0:
+            alerts.append({
+                "loop":       loop,
+                "name":       loop["name"],
+                "site_range": loop["site_range"],
+                "count":      count,
+            })
 
-    # 2. Try POST availability/resourceLocation
-    print("\n### 2. POST /api/availability/resourceLocation")
-    test(s, "POST", "/api/availability/resourceLocation",
-         body={
-             "resourceLocationId":   CYPRUS_LAKE_RLID,
-             "mapIds":               [POPLARS_MAP_ID],
-             "startDate":            START_DATE,
-             "endDate":              END_DATE,
-             "nights":               NIGHTS,
-             "bookingCategoryId":    0,
-             "isReservationResult":  True,
-             "partySize":            1,
-         },
-         label="POST availability/resourceLocation")
-
-    # 3. GET availability/resourceLocation with all params
-    print("\n### 3. GET /api/availability/resourceLocation (full params)")
-    test(s, "GET", "/api/availability/resourceLocation",
-         params={
-             "resourceLocationId":   CYPRUS_LAKE_RLID,
-             "mapId":                POPLARS_MAP_ID,
-             "startDate":            START_DATE,
-             "endDate":              END_DATE,
-             "nights":               NIGHTS,
-             "bookingCategoryId":    0,
-             "isReservationResult":  "true",
-             "partySize":            1,
-         },
-         label="GET availability/resourceLocation+params")
-
-    # 4. Calendar-style availability
-    print("\n### 4. /api/availability/resourceCategory")
-    test(s, "GET", "/api/availability/resourceCategory",
-         params={"resourceLocationId": CYPRUS_LAKE_RLID,
-                 "startDate": START_DATE, "endDate": END_DATE},
-         label="availability/resourceCategory")
-
-    # 5. Try fetching individual resource availability
-    print("\n### 5. Per-resource endpoints")
-    test(s, "GET", f"/api/availability/resource/{SAMPLE_RID}", label="availability/resource/{id}")
-    test(s, "GET", "/api/availability/resource",
-         params={"resourceId": SAMPLE_RID, "startDate": START_DATE, "endDate": END_DATE},
-         label="availability/resource?resourceId=")
-    test(s, "GET", f"/api/resource/details/{SAMPLE_RID}", label="resource/details/{id}")
-    test(s, "GET", "/api/resource/details", params={"resourceId": SAMPLE_RID}, label="resource/details?id")
-
-    # 6. Calendar
-    print("\n### 6. Calendar endpoints")
-    test(s, "GET", "/api/calendar/availability",
-         params={"resourceLocationId": CYPRUS_LAKE_RLID, "mapId": POPLARS_MAP_ID,
-                 "startDate": START_DATE, "endDate": END_DATE},
-         label="calendar/availability")
-
-    # 7. Booking flow / search
-    print("\n### 7. Booking / search")
-    test(s, "GET", "/api/booking/resource",
-         params={"resourceId": SAMPLE_RID, "startDate": START_DATE, "endDate": END_DATE},
-         label="booking/resource")
-
-    # 8. Try fetching the actual booking results page HTML and search for site names
-    print("\n### 8. Fetching booking results page HTML")
-    booking_url = (f"{BASE_URL}/create-booking/results"
-                   f"?mapId={POPLARS_MAP_ID}"
-                   f"&resourceLocationId={CYPRUS_LAKE_RLID}"
-                   f"&startDate={START_DATE}&endDate={END_DATE}"
-                   f"&nights={NIGHTS}&bookingCategoryId=0")
-    print(f"  URL: {booking_url}")
-    try:
-        r = s.get(booking_url, timeout=20)
-        print(f"  status: {r.status_code}")
-        print(f"  length: {len(r.text)}")
-        # Look for embedded JSON or site names
-        import re
-        nums = re.findall(r'"name"\s*:\s*"(\d+)"', r.text)
-        if nums:
-            print(f"  Found {len(nums)} numeric names embedded: {nums[:30]}")
-        sites = re.findall(r'(?:Site|site)[\s_-]?(\d+)', r.text)
-        if sites:
-            print(f"  Found 'Site N' references: {set(sites[:30])}")
-        # Look for resourceId references
-        rids = re.findall(r'"resourceId"\s*:\s*(-?\d+)', r.text)
-        if rids:
-            print(f"  Found {len(rids)} resourceIds embedded")
-        # Look for script tags with embedded data
-        scripts = re.findall(r'window\.__\w+__\s*=\s*({.+?})\s*[;<]', r.text, re.DOTALL)
-        for script in scripts[:2]:
-            print(f"  Embedded data: {script[:300]}")
-    except Exception as e:
-        print(f"  error: {e}")
+    if alerts:
+        print(f"\n🚨 {len(alerts)} loop(s) have openings!")
+        for a in alerts:
+            print(f"   {a['name']}: {a['count']} sites")
+            print(f"   {booking_url_for(a['loop'])}")
+        send_notification(alerts)
+    else:
+        print("\nNo openings. Will check again in 10 minutes.")
 
 
 if __name__ == "__main__":
