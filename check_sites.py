@@ -1,10 +1,10 @@
 """
-Cyprus Lake — Find resourceId → site name mapping
-Discovery only, no notification yet.
+Cyprus Lake — Aggressive endpoint discovery for resource name mapping
 """
 
 import os
 import sys
+import json
 import requests
 from datetime import datetime
 
@@ -15,14 +15,7 @@ BASE_URL   = "https://reservation.pc.gc.ca"
 
 CYPRUS_LAKE_RLID  = -2147483636
 POPLARS_MAP_ID    = -2147483581
-BIRCHES_MAP_ID    = -2147483580
-TAMARACKS_MAP_ID  = -2147483579
-
-LOOPS = [
-    ("Poplars",   POPLARS_MAP_ID),
-    ("Birches",   BIRCHES_MAP_ID),
-    ("Tamaracks", TAMARACKS_MAP_ID),
-]
+SAMPLE_RID        = -2147481250
 
 HEADERS = {
     "User-Agent": (
@@ -33,6 +26,7 @@ HEADERS = {
     "Accept": "application/json, */*",
     "Accept-Language": "en-CA,en;q=0.9",
     "Referer": BASE_URL + "/",
+    "Content-Type": "application/json",
 }
 
 
@@ -43,113 +37,137 @@ def get_session():
     return s
 
 
-def try_endpoint(session, url, params=None, label=""):
-    print(f"\n[{label}] GET {url}")
-    if params: print(f"  params: {params}")
+def show(label, r):
+    print(f"\n[{label}]  {r.request.method} {r.url}")
+    print(f"  status: {r.status_code}")
+    snippet = r.text[:600].replace("\n", " ")
+    print(f"  body:   {snippet}")
+
+
+def test(session, method, path, params=None, body=None, label=None):
+    url = BASE_URL + path
     try:
-        r = session.get(url, params=params, timeout=15)
-        print(f"  status: {r.status_code}")
-        if r.status_code != 200:
-            print(f"  body: {r.text[:200]}")
-            return None
-        return r.json()
+        if method == "GET":
+            r = session.get(url, params=params, timeout=15)
+        else:
+            r = session.post(url, params=params, json=body, timeout=15)
+        show(label or path, r)
+        if r.status_code == 200:
+            try:
+                return r.json()
+            except Exception:
+                return r.text
     except Exception as e:
-        print(f"  error: {e}")
-        return None
-
-
-def get_availability(session, map_id):
-    """Get availability response — has resourceIds and their availability status."""
-    data = try_endpoint(session,
-        f"{BASE_URL}/api/availability/map",
-        params={
-            "mapId":               map_id,
-            "bookingCategoryId":   0,
-            "startDate":           START_DATE,
-            "endDate":             END_DATE,
-            "nights":              NIGHTS,
-            "isReservationResult": "true",
-            "partySize":           1,
-        },
-        label=f"availability mapId={map_id}",
-    )
-    if not data:
-        return {}
-    return data.get("resourceAvailabilities", {})
-
-
-def try_get_resource_names(session, resource_location_id, sample_resource_id=None):
-    """Try every endpoint pattern to find resource name → resourceId mapping."""
-    print("\n" + "=" * 60)
-    print("TRYING TO FIND RESOURCE NAMES")
-    print("=" * 60)
-
-    candidates = [
-        f"{BASE_URL}/api/resource/list/{resource_location_id}",
-        f"{BASE_URL}/api/resourceCategory/list/{resource_location_id}",
-        f"{BASE_URL}/api/resourceCategory?resourceLocationId={resource_location_id}",
-        f"{BASE_URL}/api/availability/resourceLocation",
-        f"{BASE_URL}/api/availability/resourcelocation",
-    ]
-    for url in candidates:
-        data = try_endpoint(session, url,
-            params={"resourceLocationId": resource_location_id} if "?" not in url else None,
-            label=url.split("/api/")[-1])
-        if data:
-            print(f"  Type: {type(data).__name__}")
-            if isinstance(data, list) and data:
-                print(f"  {len(data)} items, sample: {data[0]}")
-            elif isinstance(data, dict):
-                print(f"  Keys: {list(data.keys())[:20]}")
-                # Find any items that look like resources
-                for k, v in data.items():
-                    if isinstance(v, list) and v and isinstance(v[0], dict):
-                        print(f"  {k}: {len(v)} items, sample: {v[0]}")
-                        break
-
-    if sample_resource_id:
-        # Try fetching individual resource
-        for url in [
-            f"{BASE_URL}/api/resource/{sample_resource_id}",
-            f"{BASE_URL}/api/resource?id={sample_resource_id}",
-        ]:
-            data = try_endpoint(session, url, label=f"single resource {sample_resource_id}")
-            if data:
-                print(f"  Got resource: {data}")
+        print(f"\n[{label or path}] ERROR: {e}")
+    return None
 
 
 def main():
     print(f"[{datetime.now().isoformat()}]")
-    session = get_session()
+    print("=" * 70)
+    s = get_session()
 
-    print("\n" + "=" * 60)
-    print("AVAILABILITY FOR EACH LOOP")
-    print("=" * 60)
+    # 1. List ALL resourceCategories to see if there's site-level data
+    print("\n### 1. All resourceCategories (full dump)")
+    cats = test(s, "GET", "/api/resourceCategory",
+                params={"resourceLocationId": CYPRUS_LAKE_RLID},
+                label="resourceCategory")
+    if isinstance(cats, list):
+        print(f"\n  {len(cats)} categories:")
+        for c in cats:
+            name = next((lv["name"] for lv in c.get("localizedValues",[])
+                         if lv.get("cultureName")=="en-CA"), "")
+            print(f"    id={c.get('resourceCategoryId')}  name='{name}'  type={c.get('resourceType')}")
 
-    sample_resource_id = None
-    all_resources = {}  # resourceId -> {loop, availability}
+    # 2. Try POST availability/resourceLocation
+    print("\n### 2. POST /api/availability/resourceLocation")
+    test(s, "POST", "/api/availability/resourceLocation",
+         body={
+             "resourceLocationId":   CYPRUS_LAKE_RLID,
+             "mapIds":               [POPLARS_MAP_ID],
+             "startDate":            START_DATE,
+             "endDate":              END_DATE,
+             "nights":               NIGHTS,
+             "bookingCategoryId":    0,
+             "isReservationResult":  True,
+             "partySize":            1,
+         },
+         label="POST availability/resourceLocation")
 
-    for loop_name, map_id in LOOPS:
-        avails = get_availability(session, map_id)
-        print(f"\n  {loop_name}: {len(avails)} resources returned")
-        # Print first 3 entries as sample
-        for i, (rid, alist) in enumerate(list(avails.items())[:5]):
-            avail_codes = [a.get("availability") for a in alist]
-            print(f"    resourceId={rid} availability={avail_codes}")
-            if not sample_resource_id:
-                sample_resource_id = rid
-            all_resources[rid] = {"loop": loop_name, "availability": avail_codes}
+    # 3. GET availability/resourceLocation with all params
+    print("\n### 3. GET /api/availability/resourceLocation (full params)")
+    test(s, "GET", "/api/availability/resourceLocation",
+         params={
+             "resourceLocationId":   CYPRUS_LAKE_RLID,
+             "mapId":                POPLARS_MAP_ID,
+             "startDate":            START_DATE,
+             "endDate":              END_DATE,
+             "nights":               NIGHTS,
+             "bookingCategoryId":    0,
+             "isReservationResult":  "true",
+             "partySize":            1,
+         },
+         label="GET availability/resourceLocation+params")
 
-        # Count by status
-        counts = {}
-        for rid, alist in avails.items():
-            for a in alist:
-                code = a.get("availability")
-                counts[code] = counts.get(code, 0) + 1
-        print(f"    Status code counts: {counts}")
+    # 4. Calendar-style availability
+    print("\n### 4. /api/availability/resourceCategory")
+    test(s, "GET", "/api/availability/resourceCategory",
+         params={"resourceLocationId": CYPRUS_LAKE_RLID,
+                 "startDate": START_DATE, "endDate": END_DATE},
+         label="availability/resourceCategory")
 
-    # Now try to find names
-    try_get_resource_names(session, CYPRUS_LAKE_RLID, sample_resource_id)
+    # 5. Try fetching individual resource availability
+    print("\n### 5. Per-resource endpoints")
+    test(s, "GET", f"/api/availability/resource/{SAMPLE_RID}", label="availability/resource/{id}")
+    test(s, "GET", "/api/availability/resource",
+         params={"resourceId": SAMPLE_RID, "startDate": START_DATE, "endDate": END_DATE},
+         label="availability/resource?resourceId=")
+    test(s, "GET", f"/api/resource/details/{SAMPLE_RID}", label="resource/details/{id}")
+    test(s, "GET", "/api/resource/details", params={"resourceId": SAMPLE_RID}, label="resource/details?id")
+
+    # 6. Calendar
+    print("\n### 6. Calendar endpoints")
+    test(s, "GET", "/api/calendar/availability",
+         params={"resourceLocationId": CYPRUS_LAKE_RLID, "mapId": POPLARS_MAP_ID,
+                 "startDate": START_DATE, "endDate": END_DATE},
+         label="calendar/availability")
+
+    # 7. Booking flow / search
+    print("\n### 7. Booking / search")
+    test(s, "GET", "/api/booking/resource",
+         params={"resourceId": SAMPLE_RID, "startDate": START_DATE, "endDate": END_DATE},
+         label="booking/resource")
+
+    # 8. Try fetching the actual booking results page HTML and search for site names
+    print("\n### 8. Fetching booking results page HTML")
+    booking_url = (f"{BASE_URL}/create-booking/results"
+                   f"?mapId={POPLARS_MAP_ID}"
+                   f"&resourceLocationId={CYPRUS_LAKE_RLID}"
+                   f"&startDate={START_DATE}&endDate={END_DATE}"
+                   f"&nights={NIGHTS}&bookingCategoryId=0")
+    print(f"  URL: {booking_url}")
+    try:
+        r = s.get(booking_url, timeout=20)
+        print(f"  status: {r.status_code}")
+        print(f"  length: {len(r.text)}")
+        # Look for embedded JSON or site names
+        import re
+        nums = re.findall(r'"name"\s*:\s*"(\d+)"', r.text)
+        if nums:
+            print(f"  Found {len(nums)} numeric names embedded: {nums[:30]}")
+        sites = re.findall(r'(?:Site|site)[\s_-]?(\d+)', r.text)
+        if sites:
+            print(f"  Found 'Site N' references: {set(sites[:30])}")
+        # Look for resourceId references
+        rids = re.findall(r'"resourceId"\s*:\s*(-?\d+)', r.text)
+        if rids:
+            print(f"  Found {len(rids)} resourceIds embedded")
+        # Look for script tags with embedded data
+        scripts = re.findall(r'window\.__\w+__\s*=\s*({.+?})\s*[;<]', r.text, re.DOTALL)
+        for script in scripts[:2]:
+            print(f"  Embedded data: {script[:300]}")
+    except Exception as e:
+        print(f"  error: {e}")
 
 
 if __name__ == "__main__":
