@@ -21,6 +21,7 @@ NTFY_TOPIC  = os.environ.get("NTFY_TOPIC", "")
 BOOKING_URL = "https://reservation.pc.gc.ca/"
 BASE_URL    = "https://reservation.pc.gc.ca"
 
+# No Accept-Encoding — let requests decompress automatically
 BROWSER_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -29,86 +30,64 @@ BROWSER_HEADERS = {
     ),
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "en-CA,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
     "Connection": "keep-alive",
     "Referer": BASE_URL + "/",
-    "Origin": BASE_URL,
 }
 
 
 def get_session() -> requests.Session:
     s = requests.Session()
     s.headers.update(BROWSER_HEADERS)
-    print("Fetching homepage to establish session...")
+    print("Fetching homepage...")
     try:
         r = s.get(BASE_URL, timeout=15)
         print(f"  Homepage status: {r.status_code}")
         print(f"  Cookies: {dict(s.cookies)}")
     except Exception as e:
-        print(f"  Homepage fetch failed: {e}")
+        print(f"  Homepage failed: {e}")
     return s
 
 
-def try_endpoint(session, url, params=None, label=""):
-    print(f"\n[{label}] GET {url}")
-    if params:
-        print(f"  params: {params}")
+def find_map_id(session: requests.Session) -> int | None:
+    """
+    /api/maps?resourceLocationId=-2147483644 returned 200 last run.
+    Parse it to get the mapId for the availability query.
+    """
+    url = f"{BASE_URL}/api/maps"
+    params = {"resourceLocationId": -2147483644}
+    print(f"\nGET {url} params={params}")
     try:
         r = session.get(url, params=params, timeout=15)
         print(f"  status: {r.status_code}")
-        snippet = r.text[:400].replace("\n", " ")
-        print(f"  body:   {snippet}")
-        if r.status_code == 200:
-            return r
-    except Exception as e:
-        print(f"  error: {e}")
-    return None
+        print(f"  content-type: {r.headers.get('content-type','')}")
+        print(f"  raw text (first 800 chars): {r.text[:800]}")
 
+        if r.status_code != 200:
+            return None
 
-def find_map_id(session: requests.Session) -> int | None:
-    # Pattern 1: resource location list
-    r = try_endpoint(session,
-        f"{BASE_URL}/api/resourcelocation/list/14",
-        label="resourcelocation/list")
-    if r:
         data = r.json()
-        items = data if isinstance(data, list) else data.get("resourceLocations", [])
-        for item in items:
-            name = str(item.get("name","") or "").lower()
-            if "cyprus" in name or "bruce" in name:
-                mid = item.get("mapId") or item.get("id")
-                print(f"  Found: {item.get('name')} mapId={mid}")
+        print(f"\nParsed JSON type: {type(data)}")
+
+        # Could be a list of maps or a single map object
+        if isinstance(data, list):
+            print(f"  {len(data)} map(s) returned:")
+            for m in data:
+                print(f"    {m}")
+            if data:
+                mid = data[0].get("id") or data[0].get("mapId")
+                print(f"  Using first map id={mid}")
                 return mid
-        print("  Not found. All entries:")
-        for item in items:
-            print(f"    {item}")
 
-    # Pattern 2: maps by known GoingToCamp resource location ID
-    r = try_endpoint(session,
-        f"{BASE_URL}/api/maps",
-        params={"resourceLocationId": -2147483644},
-        label="maps?resourceLocationId=-2147483644")
-    if r:
-        data = r.json()
-        mid = data.get("id") or data.get("mapId")
-        if mid:
-            return mid
-        print(f"  Keys: {list(data.keys()) if isinstance(data,dict) else type(data)}")
+        elif isinstance(data, dict):
+            print(f"  Keys: {list(data.keys())}")
+            print(f"  Full: {data}")
+            mid = data.get("id") or data.get("mapId")
+            if mid:
+                print(f"  map id={mid}")
+                return mid
 
-    # Pattern 3: direct map list
-    r = try_endpoint(session,
-        f"{BASE_URL}/api/maps/list",
-        params={"resourceLocationId": 14},
-        label="maps/list")
-    if r:
-        print(f"  Response: {r.text[:500]}")
-
-    # Pattern 4: facilities under rec area
-    r = try_endpoint(session,
-        f"{BASE_URL}/api/resourcelocation/14/facilities",
-        label="resourcelocation/14/facilities")
-    if r:
-        print(f"  Response: {r.text[:500]}")
+    except Exception as e:
+        print(f"  Error: {e}")
 
     return None
 
@@ -124,21 +103,29 @@ def get_availability(session: requests.Session, map_id: int) -> list[dict]:
         "isReservationResult": "true",
         "partySize":           1,
     }
-    r = try_endpoint(session, url, params=params, label="availability")
-    if not r:
+    print(f"\nGET {url}")
+    print(f"  params: {params}")
+    try:
+        r = session.get(url, params=params, timeout=20)
+        print(f"  status: {r.status_code}")
+        print(f"  body (first 800): {r.text[:800]}")
+        if r.status_code != 200:
+            return []
+        data = r.json()
+        sites = (
+            data.get("availability")
+            or data.get("mapLinkAvailabilities")
+            or data.get("sites")
+            or (data if isinstance(data, list) else [])
+        )
+        print(f"  Total sites: {len(sites)}")
+        if sites:
+            print(f"  Sample keys: {list(sites[0].keys())}")
+            print(f"  Sample site: {sites[0]}")
+        return sites
+    except Exception as e:
+        print(f"  Error: {e}")
         return []
-    data = r.json()
-    sites = (
-        data.get("availability")
-        or data.get("mapLinkAvailabilities")
-        or data.get("sites")
-        or (data if isinstance(data, list) else [])
-    )
-    print(f"  Total sites: {len(sites)}")
-    if sites:
-        print(f"  Sample keys: {list(sites[0].keys())}")
-        print(f"  Sample: {sites[0]}")
-    return sites
 
 
 def check_target_sites(sites: list[dict]) -> list[str]:
@@ -193,7 +180,7 @@ if __name__ == "__main__":
     map_id = find_map_id(session)
 
     if not map_id:
-        print("\nCould not determine map ID. See output above.")
+        print("\nCould not determine map ID.")
         sys.exit(1)
 
     print(f"\nUsing map_id={map_id}")
