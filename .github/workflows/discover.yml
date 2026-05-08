@@ -1,1 +1,40 @@
 
+name: 🔍 Discover Site IDs (Run Once)
+
+on:
+  workflow_dispatch:  # manual trigger only
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install camply
+        run: pip install camply
+
+      # Step 1: Find the Recreation Area ID for Bruce Peninsula
+      - name: Find Bruce Peninsula Recreation Area
+        run: |
+          echo "==== RECREATION AREAS ===="
+          camply recreation-areas --provider CanadaParks --search "Bruce Peninsula"
+
+      # Step 2: Find campground ID — plug in the rec-area ID from Step 1 output
+      # UPDATE the --rec-area value below after running Step 1
+      - name: Find Cyprus Lake Campground ID
+        run: |
+          echo "==== CAMPGROUNDS ===="
+          camply campgrounds --provider CanadaParks --rec-area ${{ vars.REC_AREA_ID || '0' }}
+
+      # Step 3: List all sites — plug in campground ID from Step 2 output
+      # UPDATE the --campground value below after running Step 2
+      - name: List All Sites and Their IDs
+        run: |
+          echo "==== ALL CAMPSITES (look for your target site numbers) ===="
+          camply list-campsites --provider CanadaParks --campground ${{ vars.CAMPGROUND_ID || '0' }}
