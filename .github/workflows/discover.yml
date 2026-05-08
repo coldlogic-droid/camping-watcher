@@ -10,8 +10,10 @@ jobs:
       - name: Install camply
         run: pip install camply
 
-      - name: List all GoingToCamp recreation areas (find Parks Canada ID)
-        run: camply recreation-areas --provider GoingToCamp
+      - name: Verify camply installed
+        run: |
+          pip show camply
+          camply --version
 
-      - name: Find Cyprus Lake campground ID
-        run: camply campgrounds --provider GoingToCamp --rec-area ${{ vars.REC_AREA_ID || '1' }}
+      - name: List GoingToCamp recreation areas
+        run: camply --debug recreation-areas --provider GoingToCamp
